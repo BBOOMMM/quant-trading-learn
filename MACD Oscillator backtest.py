@@ -12,8 +12,9 @@ Created on Tue Feb  6 11:57:46 2018
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import fix_yahoo_finance as yf
-
+import yfinance as yf
+from curl_cffi import requests
+from pathlib import Path
 
 
 # In[2]:
@@ -43,16 +44,20 @@ def signal_generation(df,method):
     signals=method(df)
     signals['positions']=0
 
+    #oscillator is the difference between two moving average
+    #when it is positive, we long, vice versa
+    signals['oscillator']=signals['ma1']-signals['ma2']
+
     #positions becomes and stays one once the short moving average is above long moving average
-    signals['positions'][ma1:]=np.where(signals['ma1'][ma1:]>=signals['ma2'][ma1:],1,0)
+    signals.loc[signals.index[ma1:], 'positions'] = np.where(
+        signals['oscillator'].iloc[ma1:] >= 0,
+        1,
+        0
+    )
 
     #as positions only imply the holding
     #we take the difference to generate real trade signal
     signals['signals']=signals['positions'].diff()
-
-    #oscillator is the difference between two moving average
-    #when it is positive, we long, vice versa
-    signals['oscillator']=signals['ma1']-signals['ma2']
 
     return signals
 
@@ -62,42 +67,48 @@ def signal_generation(df,method):
 
 #plotting the backtesting result
 def plot(new, ticker):
+
+    print(new['signals'].value_counts(dropna=False))
+    output_dir = Path(__file__).resolve().parent / 'MACD'
+    output_dir.mkdir(exist_ok=True)
+    file_prefix = f'{ticker}_{stdate}_{eddate}'
     
     #the first plot is the actual close price with long/short positions
     fig=plt.figure()
     ax=fig.add_subplot(111)
+    long_signals = new[new['signals'] == 1]
+    short_signals = new[new['signals'] == -1]
     
-    new['Close'].plot(label=ticker)
-    ax.plot(new.loc[new['signals']==1].index,new['Close'][new['signals']==1],label='LONG',lw=0,marker='^',c='g')
-    ax.plot(new.loc[new['signals']==-1].index,new['Close'][new['signals']==-1],label='SHORT',lw=0,marker='v',c='r')
+    new['Close'].plot(ax=ax, label=ticker)
+    ax.plot(long_signals.index,long_signals['Close'],label='LONG',lw=0,marker='^',c='g')
+    ax.plot(short_signals.index,short_signals['Close'],label='SHORT',lw=0,marker='v',c='r')
 
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.title('Positions')
-    
-    plt.show()
+    ax.legend(loc='best')
+    ax.grid(True)
+    ax.set_title('Positions')
+    fig.savefig(output_dir / f'{file_prefix}_positions.png', dpi=300, bbox_inches='tight')
     
     #the second plot is long/short moving average with oscillator
     #note that i use bar chart for oscillator
     fig=plt.figure()
     cx=fig.add_subplot(211)
 
-    new['oscillator'].plot(kind='bar',color='r')
+    new['oscillator'].plot(ax=cx, kind='bar', color='r')
 
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.xticks([])
-    plt.xlabel('')
-    plt.title('MACD Oscillator')
+    cx.legend(loc='best')
+    cx.grid(True)
+    cx.set_xticks([])
+    cx.set_xlabel('')
+    cx.set_title('MACD Oscillator')
 
     bx=fig.add_subplot(212)
 
-    new['ma1'].plot(label='ma1')
-    new['ma2'].plot(label='ma2',linestyle=':')
+    new['ma1'].plot(ax=bx, label='ma1')
+    new['ma2'].plot(ax=bx, label='ma2', linestyle=':')
     
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.show()
+    bx.legend(loc='best')
+    bx.grid(True)
+    fig.savefig(output_dir / f'{file_prefix}_macd_oscillator.png', dpi=300, bbox_inches='tight')
 
     
 # In[5]:
@@ -116,19 +127,30 @@ def main():
     #there is just one issue
     #entry signal is always late
     #watch out for downward EMA spirals!
-    ma1=int(input('ma1:'))
-    ma2=int(input('ma2:'))
-    stdate=input('start date in format yyyy-mm-dd:')
-    eddate=input('end date in format yyyy-mm-dd:')
-    ticker=input('ticker:')
+    ma1 = int(input('ma1 [default: 10]: ') or 10)
+    ma2 = int(input('ma2 [default: 21]: ') or 21)
+    stdate = input('start date in format yyyy-mm-dd [default: 2020-01-01]: ') or '2020-01-01'
+    eddate = input('end date in format yyyy-mm-dd [default: 2021-01-01]: ') or '2021-01-01'
+    ticker = input('ticker [default: AAPL]: ') or 'AAPL'
 
     #slicing the downloaded dataset
     #if the dataset is too large, backtesting plot would look messy
     #you get too many markers cluster together
-    slicer=int(input('slicing:'))
+    slicer = int(input('slicing [default: 0]: ') or 0)
 
     #downloading data
-    df=yf.download(ticker,start=stdate,end=eddate)
+    session = requests.Session(impersonate="chrome")
+
+    df = yf.download(
+        ticker,
+        start=stdate,
+        end=eddate,
+        progress=False,
+        auto_adjust=False,
+        session=session,
+        timeout=30,
+    )
+    print(df.columns)
     
     new=signal_generation(df,macd)
     new=new[slicer:]

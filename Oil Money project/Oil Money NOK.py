@@ -129,8 +129,7 @@ def dual_axis_plot(xaxis,data1,data2,fst_color='r',
 dual_axis_plot(df.index,df['nok'],df['interest rate'],
                fst_color='#34262b',sec_color='#cb2800',
                fig_size=(10,5),x_label='Date',
-               y_label1='NOKJPY',y_label2='Norges Bank Interest Rate 
-               %',
+               y_label1='NOKJPY',y_label2='Norges Bank Interest Rate %',
                legend1='NOKJPY',legend2='Interest Rate',
                grid=False,title='NOK vs Interest Rate')
 
@@ -478,7 +477,7 @@ om.profit(p,'nok')
 dic={}
 for holdingt in range(5,20):
     for stopp in np.arange(0.3,1.1,0.05):
-        signals=om.signal_generation(dataset,'brent','nok',om.oil_money \
+        signals=om.signal_generation(dataset,'brent','nok',om.oil_money, \
                                      holding_threshold=holdingt, \
                                      stop=stopp)
         
