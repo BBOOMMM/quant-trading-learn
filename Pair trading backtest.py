@@ -47,6 +47,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import statsmodels.api as sm
+from pathlib import Path
 
 
 # In[3]:
@@ -65,6 +66,7 @@ def EG_method(X,Y,show_summary=False):
     
     #step 1
     #estimate long run equilibrium
+    # 线性回归，Y = alpha + beta * X + epsilon
     model1=sm.OLS(Y,sm.add_constant(X)).fit()
     epsilon=model1.resid
     
@@ -159,8 +161,10 @@ def signal_generation(asset1,asset2,method,bandwidth=250):
             #create thresholds
             #conventionally one sigma is the threshold
             #two sigma reaches 95% which is relatively difficult to trigger
-            signals['z upper limit'].iloc[i:]=signals['z'].iloc[i]+np.std(model.resid)
-            signals['z lower limit'].iloc[i:]=signals['z'].iloc[i]-np.std(model.resid)
+            # signals['z upper limit'].iloc[i:]=signals['z'].iloc[i]+np.std(model.resid)
+            # signals['z lower limit'].iloc[i:]=signals['z'].iloc[i]-np.std(model.resid)
+            signals['z upper limit'].iloc[i:] = 1
+            signals['z lower limit'].iloc[i:] = -1
         
         #as z stat cannot exceed both upper and lower bounds at the same time
         #the lines below hold
@@ -188,6 +192,9 @@ def signal_generation(asset1,asset2,method,bandwidth=250):
 
 #position visualization
 def plot(data,ticker1,ticker2):    
+
+    output_dir=Path(__file__).resolve().parent/'Pair Trading'
+    output_dir.mkdir(exist_ok=True)
    
     fig=plt.figure(figsize=(10,5))
     bx=fig.add_subplot(111)   
@@ -233,7 +240,9 @@ def plot(data,ticker1,ticker2):
     plt.title('Pair Trading')
     plt.xlabel('Date')
     plt.grid(True)
-    plt.show()
+    fig.savefig(output_dir/f'{ticker1}_{ticker2}_pair_trading.png',
+                dpi=300,bbox_inches='tight')
+    plt.close(fig)
   
 
 
@@ -242,6 +251,9 @@ def plot(data,ticker1,ticker2):
 
 #visualize overall portfolio performance
 def portfolio(data):
+
+    output_dir=Path(__file__).resolve().parent/'Pair Trading'
+    output_dir.mkdir(exist_ok=True)
 
     #initial capital to calculate the actual pnl
     capital0=20000
@@ -305,7 +317,9 @@ def portfolio(data):
 
     plt.grid(True)   
     plt.title('Total Asset')
-    plt.show()
+    fig.savefig(output_dir/'portfolio_total_asset.png',
+                dpi=300,bbox_inches='tight')
+    plt.close(fig)
 
     return portfolio
 
