@@ -1,390 +1,592 @@
 # coding: utf-8
 
-# In[1]:
-
-#relative strength index(rsi) is another popular indicator for technical analysis
-#actually i believe its kinda bull shit
-#normally i read stuff on trading view wiki
-#its not like i work there and try to promote it
-#trading view wiki is a very detailed encyclopedia for different indicators
-#plz refer to the following link for more details
-# https://www.tradingview.com/wiki/Relative_Strength_Index_(RSI)
-
-#on trading view wiki, there are a couple of strategies to use rsi
-#the simplest one is overbought/oversold
-#that is what this script is about
-#we just set upper/lower boundaries capped at 30/70 for rsi
-#if rsi exceeds the bound, we bet the stock would go under price correction
-
-#another one is called divergence
-#rsi goes up and price actually goes down
-#the inventor of rsi called wilder believes bearish rsi divergence creates a selling opportunity 
-#but his protege cardwell believes bearish divergence only occurs in a bullish trend
-#so their ideas basically contradict to each other
-#i would undoubtedly give up on this bs divergence strategy
-
-#the last one is called failure swing
-#its kinda like a double bottom pattern in price itself
-#except this strategy is a pattern recognition on rsi
-#since i have written bottom w pattern for bollinger bands
-#i would not do it here
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 import yfinance as yf
 
 
-# In[2]:
+# RSI, Relative Strength Index，相对强弱指数。
+# 这份脚本包含两类 RSI 用法：
+# 1. 普通的 overbought / oversold 超买超卖策略；
+# 2. 在 RSI 序列上识别 Head-and-Shoulders 头肩顶形态。
+#
+# 注意：
+# 技术指标规则只是经验规则，不代表天然有效。
+# 真正使用前需要做样本外回测，并考虑手续费、滑点和数据偏差。
 
-#smoothed moving average
-#for details plz refer to wikipedia
-# https://en.wikipedia.org/wiki/Moving_average#Modified_moving_average
-def smma(series,n):
-    
-    output=[series[0]]
-    
-    for i in range(1,len(series)):
-        temp=output[-1]*(n-1)+series[i]
-        output.append(temp/n)
-        
+
+def _normalize_yfinance_columns(df, ticker=None):
+    """
+    yfinance 在某些版本或某些参数下会返回 MultiIndex columns。
+    这里把它整理成普通的一层列名，方便后续统一使用 df['Close']。
+    """
+
+    data = df.copy()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        # 常见情况一：列结构类似 ('Close', 'AAPL')
+        if 'Close' in data.columns.get_level_values(0):
+            if ticker is not None and ticker in data.columns.get_level_values(-1):
+                data = data.xs(ticker, level=-1, axis=1)
+            else:
+                data.columns = data.columns.get_level_values(0)
+
+        # 常见情况二：列结构类似 ('AAPL', 'Close')
+        elif 'Close' in data.columns.get_level_values(-1):
+            if ticker is not None and ticker in data.columns.get_level_values(0):
+                data = data.xs(ticker, level=0, axis=1)
+            else:
+                data.columns = data.columns.get_level_values(-1)
+
+    return data
+
+
+def _output_dir():
+    output_dir = Path(__file__).resolve().parent / 'RSI'
+    output_dir.mkdir(exist_ok=True)
+
+    return output_dir
+
+
+# Smoothed Moving Average, SMMA。
+# Wilder 版 RSI 使用的平滑方法本质上就是：
+# 第一个平滑值 = 前 n 个数的简单平均；
+# 之后的平滑值 = (上一期平滑值 * (n - 1) + 当前值) / n。
+def smma(series, n):
+    values = pd.Series(series, dtype='float64').copy()
+    output = pd.Series(np.nan, index=values.index, dtype='float64')
+
+    if n <= 0:
+        raise ValueError('n 必须是正整数')
+
+    if len(values) < n:
+        return output
+
+    # 第一个 SMMA 值用前 n 个值的简单平均初始化
+    output.iloc[n - 1] = values.iloc[:n].mean()
+
+    # 后续用 Wilder smoothing 递推
+    for i in range(n, len(values)):
+        output.iloc[i] = (output.iloc[i - 1] * (n - 1) + values.iloc[i]) / n
+
     return output
 
 
-# In[3]:
+# 计算 RSI。
+# RSI 的核心步骤：
+# 1. 计算价格变化 delta；
+# 2. 把上涨部分记为 gain，把下跌部分的绝对值记为 loss；
+# 3. 分别对 gain 和 loss 做 Wilder smoothing；
+# 4. RS = 平均上涨 / 平均下跌；
+# 5. RSI = 100 - 100 / (1 + RS)。
+def rsi(data, n=14):
+    close = pd.Series(data, dtype='float64').copy()
 
-#calculating rsi is very simple
-#except there are several versions of moving average for rsi
-#simple moving average, exponentially weighted moving average, etc
-#in this script, we use smoothed moving average(the authentic way)
-def rsi(data,n=14):
-    
-    delta=data.diff().dropna()
-    
-    up=np.where(delta>0,delta,0)
-    down=np.where(delta<0,-delta,0)
-    
-    rs=np.divide(smma(up,n),smma(down,n))
-    
-    output=100-100/(1+rs)
-    
-    return output[n-1:]
+    if n <= 0:
+        raise ValueError('n 必须是正整数')
 
+    delta = close.diff()
 
-# In[4]:
+    gain = delta.clip(lower=0).dropna()
+    loss = (-delta.clip(upper=0)).dropna()
 
-#signal generation
-#it is really easy
-#when rsi goes above 70, we short the stock
-#we bet the stock price would fall
-#vice versa
-def signal_generation(df,method,n=14):
-    
-    df['rsi']=0.0
-    df['rsi'][n:]=method(df['Close'],n=14)
-    
-    df['positions']=np.select([df['rsi']<30,df['rsi']>70], \
-                              [1,-1],default=0)
-    df['signals']=df['positions'].diff()
-    
-    return df[n:]
+    avg_gain = smma(gain, n).reindex(close.index)  # 每一个值代表过去 n 天的平均上涨和下跌
+    avg_loss = smma(loss, n).reindex(close.index)
+
+    rs = avg_gain / avg_loss   # 相对强度
+    rsi = 100 - 100 / (1 + rs)  # 把 RS 这个从 0 到无穷大的数，压缩到 0 到 100 之间, 随 rs 单增
+    # RS = 1， RSI = 50， 上涨和下跌力量一样
+    # RSI 接近 100：近期上涨力量远强于下跌力量
+    # RSI 接近 0：近期下跌力量远强于上涨力量
+    # RSI 接近 50：上涨和下跌相对均衡
+
+    # 特殊情况处理：
+    # 平均下跌为 0 且平均上涨大于 0，RSI 记为 100；
+    # 平均上涨和平均下跌都为 0，说明价格没有变化，RSI 记为 50。
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50)
+
+    return rsi
 
 
-# In[5]:
+# 普通 RSI 超买/超卖信号生成。
+#
+# positions 是目标仓位：
+# 1  表示做多；
+# -1 表示做空；
+# 0  表示空仓。
+#
+# signals 是交易动作：
+# 正数表示买入方向的交易；
+# 负数表示卖出方向的交易；
+# 0 表示不交易。
+#
+# 注意：
+# 如果从 -1 直接变成 1，signals 会等于 2，
+# 含义是先平空，再开多；
+# 如果从 1 直接变成 -1，signals 会等于 -2，
+# 含义是先平多，再开空。
+def signal_generation(df, method=rsi, n=14, lower=30, upper=70):
+    data = df.copy()
+    data = _normalize_yfinance_columns(data)
 
-#plotting
-def plot(new,ticker):
-    
-    #the first plot is the actual close price with long/short positions
-    fig=plt.figure(figsize=(10,10))
-    ax=fig.add_subplot(211)
-    
-    new['Close'].plot(label=ticker)
-    ax.plot(new.loc[new['signals']==1].index,
-            new['Close'][new['signals']==1],
-            label='LONG',lw=0,marker='^',c='g')
-    ax.plot(new.loc[new['signals']==-1].index,
-            new['Close'][new['signals']==-1],
-            label='SHORT',lw=0,marker='v',c='r')
+    if 'Close' not in data.columns:
+        raise ValueError("输入数据中必须包含 'Close' 列")
 
-    
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.title('Positions')
-    plt.xlabel('Date')
-    plt.ylabel('price')
-    
-    plt.show()
-    
-    #the second plot is rsi with overbought/oversold interval capped at 30/70
-    bx=plt.figure(figsize=(10,10)).add_subplot(212,sharex=ax)
-    new['rsi'].plot(label='relative strength index',c='#522e75')
-    bx.fill_between(new.index,30,70,alpha=0.5,color='#f22f08')
-    
-    bx.text(new.index[-45],75,'overbought',color='#594346',size=12.5)
-    bx.text(new.index[-45],25,'oversold',color='#594346',size=12.5)
-    
-    plt.xlabel('Date')
-    plt.ylabel('value')
-    plt.title('RSI')
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.show()
+    data['rsi'] = method(data['Close'], n=n)
+
+    # RSI 低于 lower 视为超卖，给出做多目标仓位；
+    # RSI 高于 upper 视为超买，给出做空目标仓位；
+    # 其他区域保持空仓。
+    data['positions'] = np.select(
+        [data['rsi'] < lower, data['rsi'] > upper],
+        [1, -1],
+        default=0
+    )
+
+    data['positions'] = pd.Series(data['positions'], index=data.index, dtype='int64')
+
+    # diff 表示仓位变化，也就是实际交易动作。
+    data['signals'] = data['positions'].diff().fillna(data['positions'])
+
+    return data.iloc[n:].copy()
 
 
-# In[6]:
+# 绘制普通 RSI 超买/超卖策略。
+# 上图是 Close 价格和交易点；
+# 下图是 RSI，以及 30/70 超卖/超买区间。
+def plot(new, ticker='ticker', lower=30, upper=70):
+    data = new.copy()
 
-#pattern recognition
-#do u really think i would write such an easy script?
-#dont be naive, here is another way of using rsi
-#unlike double bottom pattern for bollinger bands
-#this is head-shoulder pattern directly on rsi instead of price
-#well, it is actually named head and shoulders
-#but i refused to do free marketing for the shampoo
-#cuz that shampoo doesnt work at all!
-#the details of head-shoulder pattern could be found in this link
-# https://www.investopedia.com/terms/h/head-shoulders.asp
+    if data.empty:
+        print('数据为空，无法绘图。')
+        return
 
-#any way, this pattern recognition is similar to the one in bollinger bands
-#plz refer to bollinger bands for a detailed explanation
-# https://github.com/je-suis-tm/quant-trading/blob/master/Bollinger%20Bands%20Pattern%20Recognition%20backtest.py
-def pattern_recognition(df,method,lag=14):
-    
-    df['rsi']=0.0
-    df['rsi'][lag:]=method(df['Close'],lag)    
-    
-    #as usual, period is defined as the horizon for finding the pattern
-    period=25    
-    
-    #delta is the threshold of the difference between two prices
-    #if the difference is smaller than delta
-    #we can conclude two prices are not significantly different from each other
-    #the significant level is defined as delta
-    delta=0.2
-    
-    #these are the multipliers of delta
-    #we wanna make sure there is head and shoulders are significantly larger than other nodes
-    #the significant level is defined as head/shoulder multiplier*delta
-    head=1.1
-    shoulder=1.1
-    
-    df['signals']=0
-    df['cumsum']=0
-    df['coordinates']=''
-    
-    #now these are the parameters set by us based on experience
-    #entry_rsi is the rsi when we enter a trade
-    #we would exit the trade based on two conditions
-    #one is that we hold the stock for more than five days
-    #the variable for five days is called exit_days
-    #we use a variable called counter to keep track of it
-    #two is that rsi has increased more than 4 since the entry
-    #the variable for 4 is called exit_rsi
-    #when either condition is triggered, we exit the trade
-    #this is a lazy way to exit the trade
-    #cuz i dont wanna import indicators from other scripts
-    #i would suggest people to use other indicators such as macd or bollinger bands
-    #exiting trades based on rsi is definitely inefficient and unprofitable
-    entry_rsi=0.0
-    counter=0
-    exit_rsi=4
+    fig, (ax, bx) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 10),
+        sharex=True
+    )
+
+    # 价格图
+    data['Close'].plot(ax=ax, label=ticker)
+
+    buy_mask = data['signals'] > 0
+    sell_mask = data['signals'] < 0
+
+    ax.plot(
+        data.index[buy_mask],
+        data.loc[buy_mask, 'Close'],
+        label='BUY / LONG / COVER',
+        linewidth=0,
+        marker='^',
+        color='g'
+    )
+
+    ax.plot(
+        data.index[sell_mask],
+        data.loc[sell_mask, 'Close'],
+        label='SELL / SHORT',
+        linewidth=0,
+        marker='v',
+        color='r'
+    )
+
+    ax.legend(loc='best')
+    ax.grid(True)
+    ax.set_title('RSI Positions')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('price')
+
+    # RSI 图
+    data['rsi'].plot(ax=bx, label='RSI', color='#522e75')
+    bx.fill_between(
+        data.index,
+        lower,
+        upper,
+        alpha=0.5,
+        color='#f22f08',
+        label='normal range'
+    )
+
+    # 避免样本长度小于 45 时 index[-45] 报错
+    text_idx = data.index[-45] if len(data) >= 45 else data.index[0]
+
+    bx.text(text_idx, upper + 5, 'overbought', color='#594346', size=12.5)
+    bx.text(text_idx, lower - 5, 'oversold', color='#594346', size=12.5)
+
+    bx.set_xlabel('Date')
+    bx.set_ylabel('value')
+    bx.set_title('RSI')
+    bx.legend(loc='best')
+    bx.grid(True)
+
+    plt.tight_layout()
+    fig.savefig(
+        _output_dir() / f'{ticker}_rsi_positions.png',
+        dpi=300,
+        bbox_inches='tight'
+    )
+    plt.close(fig)
+
+
+# 在 RSI 序列上识别 Head-and-Shoulders 头肩顶形态。
+#
+# 这个函数识别的是 RSI 上的头肩顶，而不是价格上的头肩顶。
+# 原代码注释说是在 RSI 上识别形态，但实际用 Close 做判断；
+# 这里修正为使用 RSI。
+#
+# 策略含义：
+# 出现 RSI 头肩顶时，认为动能可能转弱，给出做空信号 -1；
+# 之后如果 RSI 从入场点下降超过 exit_rsi，或者持仓超过 exit_days，
+# 则用信号 1 平空。
+def pattern_recognition(
+    df,
+    method=rsi,
+    lag=14,
+    period=25,
+    delta=0.2,
+    head=1.1,
+    shoulder=1.1,
+    exit_rsi=4,
     exit_days=5
-    
-    #signal generation
-    #plz refer to the following link for pattern visualization
-    # https://github.com/je-suis-tm/quant-trading/blob/master/preview/rsi%20head-shoulder%20pattern.png
-    #the idea is to start with the first node i
-    #we look backwards and find the head node j with maximum value in pattern finding period
-    #between node i and node j, we find a node k with its value almost the same as node i
-    #started from node j to left, we find a node l with its value almost the same as node i
-    #between the left beginning and node l, we find a node m with its value almost the same as node i
-    #after that, we find the shoulder node n with maximum value between node m and node l
-    #finally, we find the shoulder node o with its value almost the same as node n
-    for i in range(period+lag,len(df)):
-        
-        #this is pretty much the same idea as in bollinger bands
-        #except we have two variables
-        #one for shoulder and one for the bottom nodes
-        moveon=False
-        top=0.0
-        bottom=0.0
-        
-        #we have to make sure no holding positions
-        #and the close price is not the maximum point of pattern finding horizon
-        if (df['cumsum'][i]==0) and  \
-        (df['Close'][i]!=max(df['Close'][i-period:i])):
-            
-            #get the head node j with maximum value in pattern finding period
-            #note that dataframe is in datetime index
-            #we wanna convert the result of idxmax to a numerical index number
-            j=df.index.get_loc(df['Close'][i-period:i].idxmax())
-            
-            #if the head node j is significantly larger than node i
-            #we would move on to the next phrase
-            if (np.abs(df['Close'][j]-df['Close'][i])>head*delta):
-                bottom=df['Close'][i]
-                moveon=True
-            
-            #we try to find node k between node j and node i
-            #if node k is not significantly different from node i
-            #we would move on to the next phrase
-            if moveon==True:
-                moveon=False
-                for k in range(j,i):    
-                    if (np.abs(df['Close'][k]-bottom)<delta):
-                        moveon=True
-                        break
-            
-            #we try to find node l between node j and the end of pattern finding horizon
-            #note that we start from node j to the left
-            #cuz we need to find another bottom node m later which would start from the left beginning
-            #this way we can make sure we would find a shoulder node n between node m and node l
-            #if node l is not significantly different from node i
-            #we would move on to the next phrase
-            if moveon==True:
-                moveon=False
-                for l in range(j,i-period+1,-1):
-                    if (np.abs(df['Close'][l]-bottom)<delta):
-                        moveon=True
-                        break
-                    
-            #we try to find node m between node l and the end of pattern finding horizon
-            #this time we start from left to right as usual
-            #if node m is not significantly different from node i
-            #we would move on to the next phrase
-            if moveon==True:
-                moveon=False        
-                for m in range(i-period,l):
-                    if (np.abs(df['Close'][m]-bottom)<delta):
-                        moveon=True
-                        break
-            
-            #get the shoulder node n with maximum value between node m and node l
-            #note that dataframe is in datetime index
-            #we wanna convert the result of idxmax to a numerical index number
-            #if node n is significantly larger than node i and significantly smaller than node j
-            #we would move on to the next phrase
-            if moveon==True:
-                moveon=False        
-                n=df.index.get_loc(df['Close'][m:l].idxmax())
-                if (df['Close'][n]-bottom>shoulder*delta) and \
-                (df['Close'][j]-df['Close'][n]>shoulder*delta):
-                    top=df['Close'][n]
-                    moveon=True
-                    
-            #we try to find shoulder node o between node k and node i
-            #if node o is not significantly different from node n
-            #we would set up the signals and coordinates for visualization
-            #we also need to refresh cumsum and entry_rsi for exiting the trade
-            #note that moveon is still set as True
-            #it would help the algo to ignore this round of iteration for exiting the trade
-            if moveon==True:        
-                for o in range(k,i):
-                    if (np.abs(df['Close'][o]-top)<delta):
-                        df.at[df.index[i],'signals']=-1
-                        df.at[df.index[i],'coordinates']='%s,%s,%s,%s,%s,%s,%s'%(m,n,l,j,k,o,i)
-                        df['cumsum']=df['signals'].cumsum()
-                        entry_rsi=df['rsi'][i]
-                        moveon=True
-                        break
-        
-        #each time we have a holding position
-        #counter would steadily increase
-        #if either of the exit conditions is met
-        #we exit the trade with long position
-        #and we refresh counter, entry_rsi and cumsum
-        #you may wonder why do we need cumsum?
-        #well, this is for holding positions in case you wanna check on portfolio performance
-        if entry_rsi!=0 and moveon==False:
-            counter+=1
-            if (df['rsi'][i]-entry_rsi>exit_rsi) or \
-            (counter>exit_days):
-                df.at[df.index[i],'signals']=1
-                df['cumsum']=df['signals'].cumsum()
-                counter=0
-                entry_rsi=0
-            
-    return df
+):
+    data = df.copy()
+    data = _normalize_yfinance_columns(data)
+
+    if 'Close' not in data.columns:
+        raise ValueError("输入数据中必须包含 'Close' 列")
+
+    data['rsi'] = method(data['Close'], n=lag)
+    data['signals'] = 0
+    data['cumsum'] = 0
+    data['coordinates'] = ''
+
+    rsi_values = data['rsi'].to_numpy(dtype='float64')
+
+    # position = 0 表示空仓；
+    # position = -1 表示持有空头仓位。
+    position = 0
+    entry_rsi = np.nan
+    holding_days = 0
+
+    start_i = period + lag
+
+    for i in range(start_i, len(data)):
+        signal = 0
+        coordinate_text = ''
+
+        current_rsi = rsi_values[i]
+
+        if np.isnan(current_rsi):
+            data.at[data.index[i], 'cumsum'] = position
+            continue
+
+        pattern_found = False
+
+        # ------------------------------------------------------------
+        # 识别 RSI 头肩顶形态
+        # ------------------------------------------------------------
+        #
+        # 节点顺序为：
+        # m -> n -> l -> j -> k -> o -> i
+        #
+        # j：Head，头部，是回看窗口内的最高点；
+        # n：左肩，应该低于头部，但高于 neckline 附近低点；
+        # o：右肩，应该和左肩高度接近；
+        # m、l、k、i：neckline 附近的低点或确认点。
+        #
+        # 这里用 delta 判断“两个 RSI 数值是否足够接近”。
+        # ------------------------------------------------------------
+        if position == 0:
+            window_start = i - period
+            window_end = i
+
+            window = rsi_values[window_start:window_end]
+
+            # 如果窗口内还有 NaN，则跳过，避免形态识别不稳定
+            if not np.isnan(window).any():
+                # 当前点不能是窗口内最高点；
+                # 否则它更像新的高点，而不是头肩顶右侧确认点。
+                if current_rsi < np.max(window):
+                    j = window_start + int(np.argmax(window))  # Head
+                    bottom = current_rsi
+
+                    # 头部必须显著高于当前 neckline 附近点
+                    if rsi_values[j] - bottom > head * delta:
+
+                        k = None
+                        l = None
+                        m = None
+                        n_idx = None
+                        o = None
+                        top = None
+
+                        # 在 Head 和当前点之间寻找一个 neckline 附近点 k
+                        for idx in range(j + 1, i):
+                            if abs(rsi_values[idx] - bottom) < delta:
+                                k = idx
+                                break
+
+                        # 在 Head 左侧寻找另一个 neckline 附近点 l
+                        if k is not None:
+                            for idx in range(j - 1, window_start - 1, -1):
+                                if abs(rsi_values[idx] - bottom) < delta:
+                                    l = idx
+                                    break
+
+                        # 在窗口左端到 l 之间寻找 neckline 附近点 m
+                        if l is not None:
+                            for idx in range(window_start, l):
+                                if abs(rsi_values[idx] - bottom) < delta:
+                                    m = idx
+                                    break
+
+                        # 在 m 和 l 之间寻找左肩 n
+                        if m is not None and l is not None and m + 1 < l:
+                            segment = rsi_values[m:l]
+                            if not np.isnan(segment).any():
+                                n_idx = m + int(np.argmax(segment))
+
+                                # 左肩需要显著高于 neckline，
+                                # 同时显著低于 Head。
+                                if (
+                                    rsi_values[n_idx] - bottom > shoulder * delta and
+                                    rsi_values[j] - rsi_values[n_idx] > shoulder * delta
+                                ):
+                                    top = rsi_values[n_idx]
+                                else:
+                                    n_idx = None
+
+                        # 在 k 和当前点之间寻找右肩 o
+                        # 右肩高度应该接近左肩高度。
+                        if n_idx is not None and k is not None:
+                            for idx in range(k + 1, i):
+                                if abs(rsi_values[idx] - top) < delta:
+                                    o = idx
+                                    break
+
+                        if (
+                            m is not None and
+                            n_idx is not None and
+                            l is not None and
+                            k is not None and
+                            o is not None
+                        ):
+                            signal = -1
+                            position = -1
+                            entry_rsi = current_rsi
+                            holding_days = 0
+                            coordinate_text = f'{m},{n_idx},{l},{j},{k},{o},{i}'
+                            pattern_found = True
+
+        # ------------------------------------------------------------
+        # 平空逻辑
+        # ------------------------------------------------------------
+        #
+        # 如果已经持有空头：
+        # 1. RSI 从入场点下降超过 exit_rsi，视为达到动能回落目标，平空；
+        # 2. 或者持仓超过 exit_days，也平空。
+        #
+        # pattern_found 用来避免同一根 K 线刚开空又立刻平空。
+        # ------------------------------------------------------------
+        if position == -1 and not pattern_found:
+            holding_days += 1
+
+            if (entry_rsi - current_rsi >= exit_rsi) or (holding_days >= exit_days):
+                signal = 1
+                position = 0
+                entry_rsi = np.nan
+                holding_days = 0
+
+        data.at[data.index[i], 'signals'] = signal
+        data.at[data.index[i], 'coordinates'] = coordinate_text
+        data.at[data.index[i], 'cumsum'] = position
+
+    return data
 
 
-#visualize the pattern
-def pattern_plot(new,ticker):
-    
-    #this part is to get a small slice of dataframe
-    #so we can get a clear view of head-shoulder pattern
-    a,b=list(new[new['signals']!=0].iloc[2:4].index)
-    
-    #extract coordinates for head-shoulder pattern visualization
-    temp=list(map(int,new['coordinates'][a].split(',')))
-    indexlist=list(map(lambda x:new.index[x],temp))
-    
-    #slicing
-    c=new.index.get_loc(b)
-    newbie=new[temp[0]-30:c+20]
-    
-    #first plot is always price with positions
-    ax=plt.figure(figsize=(10,10)).add_subplot(211)
-        
-    newbie['Close'].plot(label=ticker)
-    ax.plot(newbie['Close'][newbie['signals']==1],marker='^',markersize=12, \
-            lw=0,c='g',label='LONG')
-    ax.plot(newbie['Close'][newbie['signals']==-1],marker='v',markersize=12, \
-            lw=0,c='r',label='SHORT')
-    
-    plt.legend(loc=0)
-    plt.title('Positions')
-    plt.xlabel('Date')
-    plt.ylabel('price')
-    plt.grid(True)
-    plt.show()
-    
-    #second plot is head-shoulder pattern on rsi
-    bx=plt.figure(figsize=(10,10)).add_subplot(212,sharex=ax)
-    
-    newbie['rsi'].plot(label='relative strength index',c='#f4ed71')
-    
-    #we plot the overbought/oversold interval, positions and pattern
-    bx.fill_between(newbie.index,30,70,alpha=0.6,label='overbought/oversold range',color='#000d29')
-    bx.plot(newbie['rsi'][indexlist], \
-            lw=3,alpha=0.7,marker='o', \
-            markersize=6,c='#8d2f23',label='head-shoulder pattern')
-    bx.plot(newbie['rsi'][newbie['signals']==1],marker='^',markersize=12, \
-            lw=0,c='g',label='LONG')
-    bx.plot(newbie['rsi'][newbie['signals']==-1],marker='v',markersize=12, \
-            lw=0,c='r',label='SHORT')
+# 可视化 RSI Head-and-Shoulders 形态。
+# 上图展示价格和交易点；
+# 下图展示 RSI、超买/超卖区间，以及识别出来的头肩顶节点。
+def pattern_plot(new, ticker='ticker', lower=30, upper=70):
+    data = new.copy()
 
-    #put some captions on head and shoulders
-    for i in [(1,'Shoulder'),(3,'Head'),(5,'Shoulder')]:
-        plt.text(indexlist[i[0]], newbie['rsi'][indexlist[i[0]]]+2, \
-             '%s'%i[1],fontsize=10,color='#e4ebf2', \
-             horizontalalignment='center', \
-            verticalalignment='center')
-        
-    plt.title('RSI')
-    plt.legend(loc=1)
-    plt.xlabel('Date')
-    plt.ylabel('value')
-    plt.grid(True)
-    plt.show()
-    
-    
-# In[7]:
+    if data.empty:
+        print('数据为空，无法绘图。')
+        return
+
+    # 找到第一个带 coordinates 的入场信号
+    entry_rows = data[(data['signals'] == -1) & (data['coordinates'] != '')]
+
+    if entry_rows.empty:
+        print('没有识别到 RSI Head-and-Shoulders 形态，无法绘图。')
+        return
+
+    entry_label = entry_rows.index[0]
+    entry_pos = data.index.get_loc(entry_label)
+
+    # 找到入场后的第一个平空信号
+    exit_candidates = data.index[(np.arange(len(data)) > entry_pos) & (data['signals'] == 1)]
+
+    if len(exit_candidates) > 0:
+        exit_label = exit_candidates[0]
+        exit_pos = data.index.get_loc(exit_label)
+    else:
+        exit_pos = min(len(data) - 1, entry_pos + 20)
+
+    # 解析形态节点坐标
+    coordinate_text = data.at[entry_label, 'coordinates']
+    pattern_positions = [int(x) for x in coordinate_text.split(',')]
+    pattern_index = data.index[pattern_positions]
+
+    # 截取一小段数据，让图更清楚
+    start_pos = max(0, pattern_positions[0] - 30)
+    end_pos = min(len(data), exit_pos + 20)
+    view = data.iloc[start_pos:end_pos].copy()
+
+    fig, (ax, bx) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 10),
+        sharex=True
+    )
+
+    # 价格图
+    view['Close'].plot(ax=ax, label=ticker)
+
+    cover_mask = view['signals'] > 0
+    short_mask = view['signals'] < 0
+
+    ax.plot(
+        view.index[cover_mask],
+        view.loc[cover_mask, 'Close'],
+        marker='^',
+        markersize=12,
+        linewidth=0,
+        color='g',
+        label='COVER'
+    )
+
+    ax.plot(
+        view.index[short_mask],
+        view.loc[short_mask, 'Close'],
+        marker='v',
+        markersize=12,
+        linewidth=0,
+        color='r',
+        label='SHORT'
+    )
+
+    ax.legend(loc='best')
+    ax.set_title('Positions')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('price')
+    ax.grid(True)
+
+    # RSI 图
+    view['rsi'].plot(ax=bx, label='RSI', color='#f4ed71')
+
+    bx.fill_between(
+        view.index,
+        lower,
+        upper,
+        alpha=0.6,
+        label='overbought / oversold range',
+        color='#000d29'
+    )
+
+    bx.plot(
+        pattern_index,
+        data.loc[pattern_index, 'rsi'],
+        linewidth=3,
+        alpha=0.7,
+        marker='o',
+        markersize=6,
+        color='#8d2f23',
+        label='head-and-shoulders pattern'
+    )
+
+    bx.plot(
+        view.index[cover_mask],
+        view.loc[cover_mask, 'rsi'],
+        marker='^',
+        markersize=12,
+        linewidth=0,
+        color='g',
+        label='COVER'
+    )
+
+    bx.plot(
+        view.index[short_mask],
+        view.loc[short_mask, 'rsi'],
+        marker='v',
+        markersize=12,
+        linewidth=0,
+        color='r',
+        label='SHORT'
+    )
+
+    # 节点顺序为 m, n, l, j, k, o, i
+    # 其中 n 是左肩，j 是头部，o 是右肩。
+    for pos, text in [(1, 'Shoulder'), (3, 'Head'), (5, 'Shoulder')]:
+        idx = pattern_index[pos]
+        bx.text(
+            idx,
+            data.loc[idx, 'rsi'] + 2,
+            text,
+            fontsize=10,
+            color='#e4ebf2',
+            horizontalalignment='center',
+            verticalalignment='center'
+        )
+
+    bx.set_title('RSI Head-and-Shoulders')
+    bx.legend(loc='best')
+    bx.set_xlabel('Date')
+    bx.set_ylabel('value')
+    bx.grid(True)
+
+    plt.tight_layout()
+    fig.savefig(
+        _output_dir() / f'{ticker}_rsi_head_and_shoulders.png',
+        dpi=300,
+        bbox_inches='tight'
+    )
+    plt.close(fig)
 
 
 def main():
-    
-    ticker='FCAU'
-    startdate='2016-01-01'
-    enddate='2018-01-01'
-    df=yf.download(ticker,start=startdate,end=enddate)
-    new=signal_generation(df,rsi,n=14)
+    ticker = 'AAPL'
+    startdate = '2016-01-01'
+    enddate = '2018-01-01'
 
-    plot(new,ticker)
+    df = yf.download(
+        ticker,
+        start=startdate,
+        end=enddate,
+        auto_adjust=False,
+        progress=False
+    )
 
+    if df.empty:
+        raise ValueError(
+            'yfinance 没有下载到数据。可以换一个 ticker，或者改成读取本地 CSV。'
+        )
 
-#how to calculate stats could be found from my other code called Heikin-Ashi
-# https://github.com/je-suis-tm/quant-trading/blob/master/heikin%20ashi%20backtest.py
+    df = _normalize_yfinance_columns(df, ticker=ticker)
+
+    # 普通 RSI 超买/超卖信号
+    new = signal_generation(df, rsi, n=14)
+    plot(new, ticker)
+
+    # 如果想测试 RSI Head-and-Shoulders 形态，取消下面两行注释：
+    pattern_new = pattern_recognition(df, rsi, lag=14)
+    pattern_plot(pattern_new, ticker)
+
 
 if __name__ == '__main__':
     main()
-
