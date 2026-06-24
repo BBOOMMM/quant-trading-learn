@@ -1,432 +1,599 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Feb 15 20:48:35 2018
+Heikin-Ashi 策略示例：指标计算、信号生成、简单回测和绩效统计。
 
-@author: Administrator
+说明：
+1. 这份代码是在原脚本基础上修正的版本。
+2. 主要修正了 pandas 链式赋值、索引访问、信号累计、蜡烛图颜色判断、回测统计口径不一致等问题。
+3. 原策略的核心交易规则基本保留：signals=1 表示加一份多头，signals<0 表示清空已有多头。
 """
 
+from __future__ import annotations
 
-# In[1]:
+import warnings
+from pathlib import Path
+from typing import Optional
 
-
-#heikin ashi is a Japanese way to filter out the noise for momentum trading
-#it can prevent the occurrence of sideway chops
-#basically we do a few transformations on four key benchmarks - Open, Close, High, Low
-#apply some unique rules on ha Open, Close, High, Low to trade
-#details of heikin ashi indicators and rules can be found in the following link
-# https://quantiacs.com/Blog/Intro-to-Algorithmic-Trading-with-Heikin-Ashi.aspx
-
-#need to get yfinance package first
-#it changes its name from fix_yahoo_finance to yfinance, lol
-
-
-# In[2]:
-
-
-import pandas as pd
 import matplotlib.pyplot as plt
-import yfinance as yf
+from matplotlib.patches import Rectangle
 import numpy as np
-import scipy.integrate
-import scipy.stats
+import pandas as pd
+import yfinance as yf
 
 
-# In[3]:
+def _output_dir() -> Path:
+    output_dir = Path(__file__).resolve().parent / "Heikin-Ashi candlestick"
+    output_dir.mkdir(exist_ok=True)
+
+    return output_dir
 
 
+def _flatten_yfinance_columns(df: pd.DataFrame, ticker: Optional[str] = None) -> pd.DataFrame:
+    """
+    兼容新版 yfinance 的返回格式。
 
-#Heikin Ashi has a unique method to filter out the noise
-#its open, close, high, low require a different approach
-#please refer to the website mentioned above
-def heikin_ashi(data):
-    
-    df=data.copy()
-    
-    df.reset_index(inplace=True)
-        
-    #heikin ashi close
-    df['HA close']=(df['Open']+df['Close']+df['High']+df['Low'])/4
+    yfinance 在某些版本中，即使只下载一个 ticker，也可能返回 MultiIndex 列，
+    例如 ('Close', 'NVDA')。这里将其转换为普通列名：Open, High, Low, Close 等。
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
 
-    #initialize heikin ashi open
-    df['HA open']=float(0)
-    df['HA open'][0]=df['Open'][0]
+    out = df.copy()
 
-    #heikin ashi open
-    for n in range(1,len(df)):
-        df.at[n,'HA open']=(df['HA open'][n-1]+df['HA close'][n-1])/2
-        
-    #heikin ashi high/low
-    temp=pd.concat([df['HA open'],df['HA close'],df['Low'],df['High']],axis=1)
-    df['HA high']=temp.apply(max,axis=1)
-    df['HA low']=temp.apply(min,axis=1)
+    # 常见格式：第一层是价格字段，第二层是 ticker。
+    if ticker is not None and ticker in out.columns.get_level_values(-1):
+        out = out.xs(ticker, axis=1, level=-1)
+    else:
+        # 如果无法按 ticker 切分，就保留第一层字段名。
+        out.columns = out.columns.get_level_values(0)
 
-    del df['Adj Close']
-    del df['Volume']
-    
+    return out
+
+
+def download_price_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """
+    下载 OHLCV 数据。
+
+    auto_adjust=False 是为了明确保留 Open/High/Low/Close/Adj Close/Volume。
+    如果下载失败，直接抛出异常，避免后面在空 DataFrame 上报更隐蔽的错误。
+    """
+    df = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        auto_adjust=False,
+        progress=False,
+    )
+    df = _flatten_yfinance_columns(df, ticker=ticker)
+
+    if df.empty:
+        raise ValueError(f"{ticker} 在 {start} 到 {end} 之间没有下载到数据。")
+
+    required_cols = {"Open", "High", "Low", "Close"}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"下载数据缺少必要列：{sorted(missing_cols)}")
+
     return df
 
 
-# In[4]:
+def heikin_ashi(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算 Heikin-Ashi，即“平均 K 线”。
+
+    普通 K 线直接使用真实的 Open/High/Low/Close；
+    Heikin-Ashi 会对 OHLC 做平滑变换，从而减少短期噪声。
+
+    计算公式：
+    HA close = (Open + High + Low + Close) / 4
+    HA open  = 前一根 K 线的 (HA open + HA close) / 2
+    HA high  = max(High, HA open, HA close)
+    HA low   = min(Low, HA open, HA close)
+    """
+    df = data.copy()
+    df = _flatten_yfinance_columns(df)
+
+    # reset_index 后，原来的日期索引会变成 Date 或 Datetime 列。
+    df = df.reset_index()
+    if "Date" not in df.columns:
+        if "Datetime" in df.columns:
+            df = df.rename(columns={"Datetime": "Date"})
+        else:
+            df = df.rename(columns={df.columns[0]: "Date"})
+
+    required_cols = ["Open", "High", "Low", "Close"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"输入数据缺少必要列：{missing_cols}")
+
+    # Heikin-Ashi 收盘价。
+    df["HA close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4.0
+
+    # Heikin-Ashi 开盘价需要递推计算。
+    df["HA open"] = np.nan
+    df.at[0, "HA open"] = df.at[0, "Open"]
+    for n in range(1, len(df)):
+        df.at[n, "HA open"] = (df.at[n - 1, "HA open"] + df.at[n - 1, "HA close"]) / 2.0
+
+    # Heikin-Ashi 最高价和最低价。
+    ha_cols = ["HA open", "HA close", "High", "Low"]
+    df["HA high"] = df[ha_cols].max(axis=1)
+    df["HA low"] = df[ha_cols].min(axis=1)
+
+    # 这两个字段在后续策略里没有用到；用 errors="ignore" 避免新版 yfinance 没有 Adj Close 时报错。
+    df = df.drop(columns=["Adj Close", "Volume"], errors="ignore")
+
+    return df
 
 
-#setting up signal generations
-#trigger conditions can be found from the website mentioned above
-#they kinda look like marubozu candles
-#there s a short strategy as well
-#the trigger condition of short strategy is the reverse of long strategy
-#you have to satisfy all four conditions to long/short
-#nevertheless, the exit signal only has three conditions
-def signal_generation(df,method,stls):
-        
-    data=method(df)
-    
-    data['signals']=0
+def signal_generation(df: pd.DataFrame, method=heikin_ashi, stls: int = 3) -> pd.DataFrame:
+    """
+    根据 Heikin-Ashi 形态生成交易信号。
 
-    #i use cumulated sum to check how many positions i have longed
-    #i would ignore the exit signal prior if not holding positions
-    #i also keep tracking how many long positions i have got
-    #long signals cannot exceed the stop loss limit
-    data['cumsum']=0
+    signals 的含义：
+    1   ：加一份多头仓位
+    0   ：不操作
+    < 0 ：清空已有多头仓位，数值大小等于要卖出的仓位份数
 
-    for n in range(1,len(data)):
-        
-        #long triggered
-        if (data['HA open'][n]>data['HA close'][n] and data['HA open'][n]==data['HA high'][n] and
-            np.abs(data['HA open'][n]-data['HA close'][n])>np.abs(data['HA open'][n-1]-data['HA close'][n-1]) and
-            data['HA open'][n-1]>data['HA close'][n-1]):
-            
-            data.at[n,'signals']=1
-            data['cumsum']=data['signals'].cumsum()
+    stls 表示最多允许持有多少份多头仓位。
+    原代码在循环中反复整体计算 cumsum，且在修改 signals 后没有同步更新当前行 cumsum；
+    这里改成用 position 变量逐行维护仓位，逻辑更清楚，也更不容易出错。
+    """
+    if stls <= 0:
+        raise ValueError("stls 必须是正整数。")
 
+    data = method(df).copy()
+    data["signals"] = 0
+    data["cumsum"] = 0
 
-            #accumulate too many longs
-            if data['cumsum'][n]>stls:
-                data.at[n,'signals']=0
-        
-        #exit positions
-        elif (data['HA open'][n]<data['HA close'][n] and data['HA open'][n]==data['HA low'][n] and 
-        data['HA open'][n-1]<data['HA close'][n-1]):
-            
-            data.at[n,'signals']=-1
-            data['cumsum']=data['signals'].cumsum()
-        
+    position = 0
 
-            #clear all longs
-            #if there are no long positions in my portfolio
-            #ignore the exit signal
-            if data['cumsum'][n]>0:
-                data.at[n,'signals']=-1*(data['cumsum'][n-1])
+    for n in range(1, len(data)):
+        ha_open = data.at[n, "HA open"]
+        ha_close = data.at[n, "HA close"]
+        ha_high = data.at[n, "HA high"]
+        ha_low = data.at[n, "HA low"]
 
-            if data['cumsum'][n]<0:
-                data.at[n,'signals']=0
-                
+        prev_ha_open = data.at[n - 1, "HA open"]
+        prev_ha_close = data.at[n - 1, "HA close"]
+
+        # 原代码的“开多/加仓”条件：当前和上一根 HA K 线都偏弱，并且当前实体更大。
+        # 这更像是逆势抄底规则，而不是典型顺势做多规则；这里保留原策略含义。
+        long_condition = (
+            ha_open > ha_close
+            and ha_open == ha_high
+            and abs(ha_open - ha_close) > abs(prev_ha_open - prev_ha_close)
+            and prev_ha_open > prev_ha_close
+        )
+
+        # 原代码的“退出”条件：出现强势 HA 阳线时，清空已有多头。
+        exit_condition = (
+            ha_open < ha_close
+            and ha_open == ha_low
+            and prev_ha_open < prev_ha_close
+        )
+
+        signal = 0
+
+        if long_condition and position < stls:
+            signal = 1
+        elif exit_condition and position > 0:
+            signal = -position
+
+        position += signal
+        data.at[n, "signals"] = signal
+        data.at[n, "cumsum"] = position
+
     return data
 
 
-# In[5]:
+def candlestick(
+    df: pd.DataFrame,
+    ax=None,
+    titlename: str = "",
+    highcol: str = "High",
+    lowcol: str = "Low",
+    opencol: str = "Open",
+    closecol: str = "Close",
+    xcol: str = "Date",
+    colorup: str = "r",
+    colordown: str = "g",
+    width: float = 0.6,
+):
+    """
+    手动画 K 线图。
 
+    matplotlib 早期版本移除了原来的 candlestick 函数；
+    这里用矩形画实体，用竖线画上下影线。
 
-#since matplotlib remove the candlestick
-#plus we dont wanna install mpl_finance
-#we implement our own version
-#simply use fill_between to construct the bar
-#use line plot to construct high and low
-def candlestick(df,ax=None,titlename='',highcol='High',lowcol='Low',
-                opencol='Open',closecol='Close',xcol='Date',
-                colorup='r',colordown='g',**kwargs):  
-    
-    #bar width
-    #use 0.6 by default
-    dif=[(-3+i)/10 for i in range(7)]
-    
-    if not ax:
-        ax=plt.figure(figsize=(10,5)).add_subplot(111)
-    
-    #construct the bars one by one
+    默认颜色沿用原代码/国内习惯：
+    红色表示上涨，绿色表示下跌。
+    如果你想使用美股常见配色，可以把 colorup 改成 "g"，colordown 改成 "r"。
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 5))
+
+    if len(df) == 0:
+        ax.set_title(titlename)
+        return ax
+
     for i in range(len(df)):
-        
-        #width is 0.6 by default
-        #so 7 data points required for each bar
-        x=[i+j for j in dif]
-        y1=[df[opencol].iloc[i]]*7
-        y2=[df[closecol].iloc[i]]*7
+        open_price = float(df[opencol].iloc[i])
+        close_price = float(df[closecol].iloc[i])
+        high_price = float(df[highcol].iloc[i])
+        low_price = float(df[lowcol].iloc[i])
 
-        barcolor=colorup if y1[0]>y2[0] else colordown
-        
-        #no high line plot if open/close is high
-        if df[highcol].iloc[i]!=max(df[opencol].iloc[i],df[closecol].iloc[i]):
-            
-            #use generic plot to viz high and low
-            #use 1.001 as a scaling factor
-            #to prevent high line from crossing into the bar
-            plt.plot([i,i],
-                     [df[highcol].iloc[i],
-                      max(df[opencol].iloc[i],
-                          df[closecol].iloc[i])*1.001],c='k',**kwargs)
-    
-        #same as high
-        if df[lowcol].iloc[i]!=min(df[opencol].iloc[i],df[closecol].iloc[i]):             
-            
-            plt.plot([i,i],
-                     [df[lowcol].iloc[i],
-                      min(df[opencol].iloc[i],
-                          df[closecol].iloc[i])*0.999],c='k',**kwargs)
-        
-        #treat the bar as fill between
-        plt.fill_between(x,y1,y2,
-                         edgecolor='k',
-                         facecolor=barcolor,**kwargs)
+        # 原代码这里写反了：Open > Close 是下跌，Close >= Open 才是上涨。
+        bar_color = colorup if close_price >= open_price else colordown
 
-    #only show 5 xticks
-    plt.xticks(range(0,len(df),len(df)//5),df[xcol][0::len(df)//5].dt.date)
-    plt.title(titlename)
-    
-    
-#plotting the backtesting result
-def plot(df,ticker):    
-    
-    df.set_index(df['Date'],inplace=True)
-    
-    #first plot is Heikin-Ashi candlestick
-    #use candlestick function and set Heikin-Ashi O,C,H,L
-    ax1=plt.subplot2grid((200,1), (0,0), rowspan=120,ylabel='HA price')
-    candlestick(df,ax1,titlename='',highcol='HA high',lowcol='HA low',
-                opencol='HA open',closecol='HA close',xcol='Date',
-                colorup='r',colordown='g')
-    plt.grid(True)
-    plt.xticks([])
-    plt.title('Heikin-Ashi')
+        # 画上下影线。
+        ax.plot([i, i], [low_price, high_price], color="k", linewidth=0.8)
+
+        # 画实体。若开盘价等于收盘价，则画一条横线。
+        body_bottom = min(open_price, close_price)
+        body_height = abs(close_price - open_price)
+
+        if body_height == 0:
+            ax.plot(
+                [i - width / 2, i + width / 2],
+                [close_price, close_price],
+                color="k",
+                linewidth=0.8,
+            )
+        else:
+            rect = Rectangle(
+                (i - width / 2, body_bottom),
+                width,
+                body_height,
+                facecolor=bar_color,
+                edgecolor="k",
+                linewidth=0.8,
+            )
+            ax.add_patch(rect)
+
+    # 只显示约 5 个横轴刻度，避免日期太密。
+    step = max(1, len(df) // 5)
+    tick_locs = list(range(0, len(df), step))
+    tick_labels = pd.to_datetime(df[xcol].iloc[tick_locs]).dt.strftime("%Y-%m-%d")
+
+    ax.set_xticks(tick_locs)
+    ax.set_xticklabels(tick_labels, rotation=0)
+    ax.set_title(titlename)
+    ax.autoscale_view()
+
+    return ax
 
 
-    #the second plot is the actual price with long/short positions as up/down arrows
-    ax2=plt.subplot2grid((200,1), (120,0), rowspan=80,ylabel='price',xlabel='')
-    df['Close'].plot(ax=ax2,label=ticker)
+def plot(trading_signals: pd.DataFrame, ticker: str):
+    """
+    画两张图：
+    1. Heikin-Ashi K 线图；
+    2. 真实收盘价曲线，并标出加仓和清仓位置。
+    """
+    df = trading_signals.copy()
 
-    #long/short positions are attached to the real close price of the stock
-    #set the line width to zero
-    #thats why we only observe markers
-    ax2.plot(df.loc[df['signals']==1].index,df['Close'][df['signals']==1],marker='^',lw=0,c='g',label='long')
-    ax2.plot(df.loc[df['signals']<0].index,df['Close'][df['signals']<0],marker='v',lw=0,c='r',label='short')
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date", drop=False)
 
-    plt.grid(True)
-    plt.legend(loc='best')
-    plt.show()
+    fig = plt.figure(figsize=(12, 8))
 
+    # 上半部分：Heikin-Ashi K 线。
+    ax1 = plt.subplot2grid((200, 1), (0, 0), rowspan=120, ylabel="HA price")
+    candlestick(
+        df,
+        ax=ax1,
+        titlename="Heikin-Ashi",
+        highcol="HA high",
+        lowcol="HA low",
+        opencol="HA open",
+        closecol="HA close",
+        xcol="Date",
+        colorup="r",
+        colordown="g",
+    )
+    ax1.grid(True)
+    ax1.set_xticklabels([])
 
+    # 下半部分：真实价格和交易信号。
+    ax2 = plt.subplot2grid((200, 1), (120, 0), rowspan=80, ylabel="price")
+    df["Close"].plot(ax=ax2, label=ticker)
 
-# In[6]:
+    # signals=1 是加多；signals<0 是清仓，不是真正意义上的做空。
+    long_mask = df["signals"] == 1
+    exit_mask = df["signals"] < 0
 
+    ax2.plot(
+        df.index[long_mask],
+        df.loc[long_mask, "Close"],
+        marker="^",
+        linestyle="None",
+        color="g",
+        label="long",
+    )
+    ax2.plot(
+        df.index[exit_mask],
+        df.loc[exit_mask, "Close"],
+        marker="v",
+        linestyle="None",
+        color="r",
+        label="exit",
+    )
 
-#backtesting
-#initial capital 10k to calculate the actual pnl  
-#100 shares to buy of every position
-def portfolio(data,capital0=10000,positions=100):   
-        
-    #cumsum column is created to check the holding of the position
-    data['cumsum']=data['signals'].cumsum()
+    ax2.grid(True)
+    ax2.legend(loc="best")
 
-    portfolio=pd.DataFrame()
-    portfolio['holdings']=data['cumsum']*data['Close']*positions
-    portfolio['cash']=capital0-(data['signals']*data['Close']*positions).cumsum()
-    portfolio['total asset']=portfolio['holdings']+portfolio['cash']
-    portfolio['return']=portfolio['total asset'].pct_change()
-    portfolio['signals']=data['signals']
-    portfolio['date']=data['Date']
-    portfolio.set_index('date',inplace=True)
-
-    return portfolio
-
-
-# In[7]:
-
-
-#plotting the asset value change of the portfolio
-def profit(portfolio):
-        
-    fig=plt.figure()
-    bx=fig.add_subplot(111)
-    
-    portfolio['total asset'].plot(label='Total Asset')
-    
-    #long/short position markers related to the portfolio
-    #the same mechanism as the previous one
-    #replace close price with total asset value
-    bx.plot(portfolio['signals'].loc[portfolio['signals']==1].index,portfolio['total asset'][portfolio['signals']==1],lw=0,marker='^',c='g',label='long')
-    bx.plot(portfolio['signals'].loc[portfolio['signals']<0].index,portfolio['total asset'][portfolio['signals']<0],lw=0,marker='v',c='r',label='short')
-    
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.xlabel('Date')
-    plt.ylabel('Asset Value')
-    plt.title('Total Asset')
-    plt.show()
-
-
-# In[8]:
-
-
-#omega ratio is a variation of sharpe ratio
-#the risk free return is replaced by a given threshold
-#in this case, the return of benchmark
-#integral is needed to calculate the return above and below the threshold
-#you can use summation to do approximation as well
-#it is a more reasonable ratio to measure the risk adjusted return
-#normal distribution doesnt explain the fat tail of returns
-#so i use student T cumulated distribution function instead 
-#to make our life easier, i do not use empirical distribution
-#the cdf of empirical distribution is much more complex
-#check wikipedia for more details
-# https://en.wikipedia.org/wiki/Omega_ratio
-def omega(risk_free,degree_of_freedom,maximum,minimum):
-
-    y=scipy.integrate.quad(lambda g:1-scipy.stats.t.cdf(g,degree_of_freedom),risk_free,maximum)
-    x=scipy.integrate.quad(lambda g:scipy.stats.t.cdf(g,degree_of_freedom),minimum,risk_free)
-
-    z=(y[0])/(x[0])
-
-    return z
+    plt.tight_layout()
+    fig.savefig(
+        _output_dir() / f"{ticker}_heikin_ashi_candlestick.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
 
 
-#sortino ratio is another variation of sharpe ratio
-#the standard deviation of all returns is substituted with standard deviation of negative returns
-#sortino ratio measures the impact of negative return on return
-#i am also using student T probability distribution function instead of normal distribution
-#check wikipedia for more details
-# https://en.wikipedia.org/wiki/Sortino_ratio
-def sortino(risk_free,degree_of_freedom,growth_rate,minimum):
+def portfolio(data: pd.DataFrame, capital0: float = 10000, positions: int = 100) -> pd.DataFrame:
+    """
+    根据交易信号计算简单组合净值。
 
-    v=np.sqrt(np.abs(scipy.integrate.quad(lambda g:((risk_free-g)**2)*scipy.stats.t.pdf(g,degree_of_freedom),risk_free,minimum)))
-    s=(growth_rate-risk_free)/v[0]
+    capital0 ：初始资金
+    positions：每一份信号对应的股票数量
 
-    return s
+    这里假设：
+    1. 按当天 Close 价格成交；
+    2. 不考虑手续费、滑点、印花税；
+    3. signals=1 买入 positions 股；
+    4. signals<0 卖出对应倍数的 positions 股。
+    """
+    data = data.copy()
 
+    if "cumsum" not in data.columns:
+        data["cumsum"] = data["signals"].cumsum()
 
-#i use a function to calculate maximum drawdown
-#the idea is simple
-#for every day, we take the current asset value marked to market
-#to compare with the previous highest asset value
-#we get our daily drawdown
-#it is supposed to be negative if the current one is not the highest
-#we implement a temporary variable to store the minimum negative value
-#which is called maximum drawdown
-#for each daily drawdown that is smaller than our temporary value
-#we update the temp until we finish our traversal
-#in the end we return the maximum drawdown
-def mdd(series):
+    result = pd.DataFrame(index=pd.to_datetime(data["Date"]) if "Date" in data.columns else data.index)
 
-    minimum=0
-    for i in range(1,len(series)):
-        if minimum>(series[i]/max(series[:i])-1):
-            minimum=(series[i]/max(series[:i])-1)
+    result["holdings"] = data["cumsum"].to_numpy() * data["Close"].to_numpy() * positions
+    result["cash"] = capital0 - (data["signals"].to_numpy() * data["Close"].to_numpy() * positions).cumsum()
+    result["total asset"] = result["holdings"] + result["cash"]
+    result["return"] = result["total asset"].pct_change()
+    result["signals"] = data["signals"].to_numpy()
 
-    return minimum
+    return result
 
 
-# In[9]:
-    
+def profit(portfolio_details: pd.DataFrame):
+    """
+    画组合总资产曲线，并标出加仓和清仓位置。
+    """
+    fig, ax = plt.subplots(figsize=(12, 5))
 
-#stats calculation
-def stats(portfolio,trading_signals,stdate,eddate,capital0=10000):
+    portfolio_details["total asset"].plot(ax=ax, label="Total Asset")
 
-    stats=pd.DataFrame([0])
+    long_mask = portfolio_details["signals"] == 1
+    exit_mask = portfolio_details["signals"] < 0
 
-    #get the min and max of return
-    maximum=np.max(portfolio['return'])
-    minimum=np.min(portfolio['return'])    
+    ax.plot(
+        portfolio_details.index[long_mask],
+        portfolio_details.loc[long_mask, "total asset"],
+        linestyle="None",
+        marker="^",
+        color="g",
+        label="long",
+    )
+    ax.plot(
+        portfolio_details.index[exit_mask],
+        portfolio_details.loc[exit_mask, "total asset"],
+        linestyle="None",
+        marker="v",
+        color="r",
+        label="exit",
+    )
 
-    #growth_rate denotes the average growth rate of portfolio 
-    #use geometric average instead of arithmetic average for percentage growth
-    growth_rate=(float(portfolio['total asset'].iloc[-1]/capital0))**(1/len(trading_signals))-1
+    ax.legend(loc="best")
+    ax.grid(True)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Asset Value")
+    ax.set_title("Total Asset")
 
-    #calculating the standard deviation
-    std=float(np.sqrt((((portfolio['return']-growth_rate)**2).sum())/len(trading_signals)))
-
-    #use S&P500 as benchmark
-    benchmark=yf.download('^GSPC',start=stdate,end=eddate)
-
-    #return of benchmark
-    return_of_benchmark=float(benchmark['Close'].iloc[-1]/benchmark['Open'].iloc[0]-1)
-
-    #rate_of_benchmark denotes the average growth rate of benchmark 
-    #use geometric average instead of arithmetic average for percentage growth
-    rate_of_benchmark=(return_of_benchmark+1)**(1/len(trading_signals))-1
-
-    del benchmark
-
-    #backtesting stats
-    #CAGR stands for cumulated average growth rate
-    stats['CAGR']=stats['portfolio return']=float(0)
-    stats['CAGR'][0]=growth_rate
-    stats['portfolio return'][0]=portfolio['total asset'].iloc[-1]/capital0-1
-    stats['benchmark return']=return_of_benchmark
-    stats['sharpe ratio']=(growth_rate-rate_of_benchmark)/std
-    stats['maximum drawdown']=mdd(portfolio['total asset'])
-
-    #calmar ratio is sorta like sharpe ratio
-    #the standard deviation is replaced by maximum drawdown
-    #it is the measurement of return after worse scenario adjustment
-    #check wikipedia for more details
-    # https://en.wikipedia.org/wiki/Calmar_ratio
-    stats['calmar ratio']=growth_rate/stats['maximum drawdown']
-    stats['omega ratio']=omega(rate_of_benchmark,len(trading_signals),maximum,minimum)
-    stats['sortino ratio']=sortino(rate_of_benchmark,len(trading_signals),growth_rate,minimum)
-
-    #note that i use stop loss limit to limit the numbers of longs
-    #and when clearing positions, we clear all the positions at once
-    #so every long is always one, and short cannot be larger than the stop loss limit
-    stats['numbers of longs']=trading_signals['signals'].loc[trading_signals['signals']==1].count()
-    stats['numbers of shorts']=trading_signals['signals'].loc[trading_signals['signals']<0].count()
-    stats['numbers of trades']=stats['numbers of shorts']+stats['numbers of longs']  
-
-    #to get the total length of trades
-    #given that cumsum indicates the holding of positions
-    #we can get all the possible outcomes when cumsum doesnt equal zero
-    #then we count how many non-zero positions there are
-    #we get the estimation of total length of trades
-    stats['total length of trades']=trading_signals['signals'].loc[trading_signals['cumsum']!=0].count()
-    stats['average length of trades']=stats['total length of trades']/stats['numbers of trades']
-    stats['profit per trade']=float(0)
-    stats['profit per trade'].iloc[0]=(portfolio['total asset'].iloc[-1]-capital0)/stats['numbers of trades'].iloc[0]
-
-    del stats[0]
-    print(stats)
+    plt.tight_layout()
+    fig.savefig(
+        _output_dir() / "total_asset.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
 
 
-# In[10]:
+def omega_ratio(returns: pd.Series, threshold: float = 0.0) -> float:
+    """
+    经验 Omega Ratio。
+
+    原代码用 t 分布积分近似，但把真实收益率直接放进 t 分布变量中，解释性较弱。
+    这里改为常见的经验计算方式：
+
+    Omega = sum(max(r - threshold, 0)) / sum(max(threshold - r, 0))
+    """
+    r = pd.Series(returns).dropna()
+    if len(r) == 0:
+        return np.nan
+
+    excess = r - threshold
+    gain = excess[excess > 0].sum()
+    loss = -excess[excess < 0].sum()
+
+    if loss == 0:
+        return np.inf
+
+    return float(gain / loss)
+
+
+def sortino_ratio(returns: pd.Series, threshold: float = 0.0) -> float:
+    """
+    经验 Sortino Ratio。
+
+    Sortino Ratio 只惩罚低于阈值的下行波动：
+    Sortino = (mean(return) - threshold) / downside_deviation
+    """
+    r = pd.Series(returns).dropna()
+    if len(r) == 0:
+        return np.nan
+
+    downside = np.minimum(r - threshold, 0.0)
+    downside_deviation = np.sqrt(np.mean(downside ** 2))
+
+    if downside_deviation == 0:
+        return np.inf
+
+    return float((r.mean() - threshold) / downside_deviation)
+
+
+def mdd(series: pd.Series) -> float:
+    """
+    计算最大回撤。
+
+    对每一天，用当前资产值除以历史最高资产值再减 1；
+    所有回撤中的最小值就是最大回撤，通常是一个非正数。
+    """
+    s = pd.Series(series).dropna()
+    if len(s) == 0:
+        return np.nan
+
+    running_max = s.cummax()
+    drawdown = s / running_max - 1.0
+
+    return float(drawdown.min())
+
+
+def stats(
+    portfolio_details: pd.DataFrame,
+    trading_signals: pd.DataFrame,
+    stdate: Optional[str] = None,
+    eddate: Optional[str] = None,
+    capital0: float = 10000,
+) -> pd.DataFrame:
+    """
+    计算回测统计指标。
+
+    注意：
+    1. portfolio_details 和 trading_signals 应该来自同一段时间；
+    2. 原代码在 main 中用截取后的 viz 做 portfolio，却用全量 trading_signals 做 stats，
+       这里建议统一使用全量，或者统一使用截取后的数据；
+    3. 这里默认用 S&P 500 作为基准，下载失败时相关指标记为 NaN。
+    """
+    if len(portfolio_details) == 0:
+        raise ValueError("portfolio_details 为空，无法统计。")
+
+    total_asset = portfolio_details["total asset"].dropna()
+    returns = portfolio_details["return"].dropna()
+
+    if len(total_asset) == 0:
+        raise ValueError("total asset 为空，无法统计。")
+
+    total_return = float(total_asset.iloc[-1] / capital0 - 1.0)
+    n_periods = max(len(total_asset) - 1, 1)
+    growth_rate = float((1.0 + total_return) ** (1.0 / n_periods) - 1.0)
+
+    std = float(returns.std(ddof=0)) if len(returns) > 0 else np.nan
+    maximum = float(returns.max()) if len(returns) > 0 else np.nan
+    minimum = float(returns.min()) if len(returns) > 0 else np.nan
+
+    benchmark_return = np.nan
+    benchmark_growth_rate = 0.0
+
+    if stdate is not None and eddate is not None:
+        try:
+            benchmark = download_price_data("^GSPC", stdate, eddate)
+            benchmark_return = float(benchmark["Close"].iloc[-1] / benchmark["Open"].iloc[0] - 1.0)
+            benchmark_growth_rate = float((1.0 + benchmark_return) ** (1.0 / n_periods) - 1.0)
+        except Exception as exc:
+            warnings.warn(f"基准数据下载或计算失败，benchmark 指标将记为 NaN。原因：{exc}")
+            benchmark_return = np.nan
+            benchmark_growth_rate = 0.0
+
+    sharpe = (
+        (growth_rate - benchmark_growth_rate) / std
+        if std is not None and not np.isnan(std) and std != 0
+        else np.nan
+    )
+
+    max_drawdown = mdd(total_asset)
+
+    # 最大回撤是负数，Calmar Ratio 通常用 abs(max_drawdown) 做分母。
+    calmar = growth_rate / abs(max_drawdown) if max_drawdown not in [0, np.nan] and not np.isnan(max_drawdown) else np.nan
+
+    signals = trading_signals["signals"]
+    cumsum = trading_signals["cumsum"] if "cumsum" in trading_signals.columns else signals.cumsum()
+
+    number_of_longs = int((signals == 1).sum())
+    number_of_exits = int((signals < 0).sum())
+    number_of_trades = number_of_longs + number_of_exits
+    total_length_of_trades = int((cumsum != 0).sum())
+
+    average_length_of_trades = (
+        total_length_of_trades / number_of_trades if number_of_trades > 0 else np.nan
+    )
+    profit_per_trade = (
+        (float(total_asset.iloc[-1]) - capital0) / number_of_trades
+        if number_of_trades > 0
+        else np.nan
+    )
+
+    result = pd.DataFrame(
+        {
+            "CAGR": [growth_rate],
+            "portfolio return": [total_return],
+            "benchmark return": [benchmark_return],
+            "sharpe ratio": [sharpe],
+            "maximum drawdown": [max_drawdown],
+            "calmar ratio": [calmar],
+            "omega ratio": [omega_ratio(returns, benchmark_growth_rate)],
+            "sortino ratio": [sortino_ratio(returns, benchmark_growth_rate)],
+            "numbers of longs": [number_of_longs],
+            # 原代码叫 shorts，但这里 signals<0 实际是清仓，不是做空。
+            "numbers of exits": [number_of_exits],
+            "numbers of trades": [number_of_trades],
+            "total length of trades": [total_length_of_trades],
+            "average length of trades": [average_length_of_trades],
+            "profit per trade": [profit_per_trade],
+            "max period return": [maximum],
+            "min period return": [minimum],
+        }
+    )
+
+    print(result)
+    return result
+
 
 def main():
-    
-    #initializing
+    """
+    主函数：下载数据、生成信号、回测、画图、输出统计。
 
-    #stop loss positions, the maximum long positions we can get
-    #without certain constraints, you will long indefinites times 
-    #as long as the market condition triggers the signal
-    #in a whipsaw condition, it is suicidal
-    stls=3
-    ticker='NVDA'
-    stdate='2015-04-01'
-    eddate='2018-02-15'
+    如果你本地 yfinance 下载失败，通常不是代码逻辑错误，
+    而是网络环境、Yahoo Finance 限流、代理或 yfinance 版本问题。
+    """
+    # 最多持有 3 份多头仓位。
+    stls = 3
 
-    #slicer is used for plotting
-    #a three year dataset with 750 data points would be too much
-    slicer=700
+    ticker = "NVDA"
+    stdate = "2015-04-01"
+    eddate = "2018-02-15"
 
-    #downloading data
-    df=yf.download(ticker,start=stdate,end=eddate)
+    # 只截取最后一部分数据画图；回测统计默认仍使用全量数据。
+    slicer = 700
 
-    trading_signals=signal_generation(df,heikin_ashi,stls)
+    df = download_price_data(ticker, stdate, eddate)
 
-    viz=trading_signals[slicer:]
-    plot(viz,ticker)
+    trading_signals = signal_generation(df, heikin_ashi, stls)
 
-    portfolio_details=portfolio(viz)
-    profit(portfolio_details)
+    viz = trading_signals.iloc[slicer:].copy()
+    if len(viz) > 0:
+        plot(viz, ticker)
 
-    stats(portfolio_details,trading_signals,stdate,eddate)
+    portfolio_details = portfolio(trading_signals)
+    profit(portfolio_details.iloc[slicer:].copy())
 
-    #note that this is the only py file with complete stats calculation
-    
-    
-    
-if __name__ == '__main__':
+    stats(portfolio_details, trading_signals, stdate, eddate)
+
+
+if __name__ == "__main__":
     main()
