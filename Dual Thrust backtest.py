@@ -1,234 +1,301 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Mar 19 15:22:38 2018
-@author: Administrator
+Dual Thrust 开盘区间突破策略示例。
 
+策略思想：
+1. 先用过去若干个交易日的日内 open/close/high/low 计算波动区间 range；
+2. 当天市场开盘时，根据开盘价和 range 生成上、下突破阈值；
+3. 价格突破上阈值时做多，跌破下阈值时做空；
+4. 如果盘中从多头反转为空头，或从空头反转为多头，则直接反手；
+5. 到日内交易结束时间，清空所有仓位。
+
+这份脚本使用项目内 data/gbpusd.csv 的 1 分钟 GBP/USD 数据。
 """
-# In[1]:
 
-#dual thrust is an opening range breakout strategy
-#it is very similar to London Breakout
-#please check London Breakout if u have any questions
-# https://github.com/je-suis-tm/quant-trading/blob/master/London%20Breakout%20backtest.py
-#Initially we set up upper and lower thresholds based on previous days open, close, high and low 
-#When the market opens and the price exceeds thresholds, we would take long/short positions prior to upper/lower thresholds 
-#However, there is no stop long/short position in this strategy
-#We clear all positions at the end of the day
-#rules of dual thrust can be found in the following link
-# https://www.quantconnect.com/tutorials/dual-thrust-trading-algorithm/
+from pathlib import Path
 
-import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# In[2]:
 
-os.chdir('D:/')
+def load_price_data(data_path='data/gbpusd.csv'):
+    """
+    读取本地 1 分钟价格数据。
+
+    数据需要至少包含两列：
+    date  ：时间
+    price ：价格
+    """
+
+    path = Path(data_path)
+    if not path.exists():
+        raise FileNotFoundError(f'找不到数据文件：{path}')
+
+    df = pd.read_csv(path, encoding='utf-8-sig')
+
+    required_cols = {'date', 'price'}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f'数据缺少必要列：{sorted(missing_cols)}')
+
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date', drop=False).sort_index()
+
+    return df
 
 
-# In[3]:
+def min2day(df, column='price', rg=5, start_hour=3, end_hour=12):
+    """
+    将 1 分钟数据聚合成日内 OHLC，并计算 Dual Thrust 的历史波动区间。
 
+    注意：
+    range 必须用过去 rg 个交易日计算，不能使用当天完整 high/low，
+    否则会产生前视偏差。
+    """
 
-#data frequency convertion from minute to intra daily
-#as we are doing backtesting, we have already got all the datasets we need
-#we can create a table to store all open, close, high and low prices
-#and calculate the range before we get to signal generation
-#otherwise, we would have to put this part inside the loop
-#it would greatly increase the time complexity
-#however, in real time trading, we do not have futures price
-#we have to store all past information in sql db
-#we have to calculate the range from db before the market opens
+    rows = []
 
-def min2day(df,column,year,month,rg):
-    
-    #lets create a dictionary 
-    #we use keys to classify different info we need
-    memo={'date':[],'open':[],'close':[],'high':[],'low':[]}
-    
-    #no matter which month
-    #the maximum we can get is 31 days
-    #thus, we only need to run a traversal on 31 days
-    #nevertheless, not everyday is a workday
-    #assuming our raw data doesnt contain weekend prices
-    #we use try function to make sure we get the info of workdays without errors
-    #note that i put date at the end of the loop
-    #the date appendix doesnt depend on our raw data
-    #it only relies on the range function above
-    #we could accidentally append weekend date if we put it at the beginning of try function
-    #not until the program cant find price in raw data will the program stop
-    #by that time, we have already appended weekend date
-    #we wanna make sure the length of all lists in dictionary are the same
-    #so that we can construct a structured table in the next step
-    for i in range(1,32):
-    
-        try:
-            temp=df['%s-%s-%s 3:00:00'%(year,month,i):'%s-%s-%s 12:00:00'%(year,month,i)][column]
+    for day, group in df.groupby(df.index.normalize()):
+        intraday = group.between_time(f'{start_hour:02d}:00', f'{end_hour:02d}:00')
 
-            memo['open'].append(temp[0])
-            memo['close'].append(temp[-1])
-            memo['high'].append(max(temp))
-            memo['low'].append(min(temp))
-            memo['date'].append('%s-%s-%s'%(year,month,i))
-       
+        if intraday.empty:
+            continue
 
-        except Exception:
-            pass
-        
-    intraday=pd.DataFrame(memo)
-    intraday.set_index(pd.to_datetime(intraday['date']),inplace=True)
-    
-    
-    #preparation
-    intraday['range1']=intraday['high'].rolling(rg).max()-intraday['close'].rolling(rg).min()
-    intraday['range2']=intraday['close'].rolling(rg).max()-intraday['low'].rolling(rg).min()
-    intraday['range']=np.where(intraday['range1']>intraday['range2'],intraday['range1'],intraday['range2'])
-    
+        rows.append({
+            'date': day,
+            'open': intraday[column].iloc[0],
+            'close': intraday[column].iloc[-1],
+            'high': intraday[column].max(),
+            'low': intraday[column].min(),
+        })
+
+    intraday = pd.DataFrame(rows)
+
+    if intraday.empty:
+        raise ValueError('无法从分钟数据中生成日内 OHLC。')
+
+    intraday = intraday.set_index('date')
+
+    previous_high = intraday['high'].shift(1)
+    previous_low = intraday['low'].shift(1)
+    previous_close = intraday['close'].shift(1)
+
+    intraday['range1'] = (
+        previous_high.rolling(rg).max() -
+        previous_close.rolling(rg).min()
+    )
+    intraday['range2'] = (
+        previous_close.rolling(rg).max() -
+        previous_low.rolling(rg).min()
+    )
+    intraday['range'] = np.maximum(intraday['range1'], intraday['range2'])
+
     return intraday
 
 
-#signal generation
-#even replace assignment with pandas.at
-#it still takes a while for us to get the result
-#any optimization suggestion besides using numpy array?
-def signal_generation(df,intraday,param,column,rg):
-    
-    #as the lags of days have been set to 5  
-    #we should start our backtesting after 4 workdays of current month
-    #cumsum is to control the holding of underlying asset
-    #sigup and siglo are the variables to store the upper/lower threshold  
-    #upper and lower are for the purpose of tracking sigup and siglo
-    signals=df[df.index>=intraday['date'].iloc[rg-1]]
-    signals['signals']=0
-    signals['cumsum']=0
-    signals['upper']=0.0
-    signals['lower']=0.0
-    sigup=float(0)
-    siglo=float(0)
-    
-    #for traversal on time series
-    #the tricky part is the slicing
-    #we have to either use [i:i] or pd.Series
-    #first we set up thresholds at the beginning of london market
-    #which is est 3am
-    #if the price exceeds either threshold
-    #we will take long/short positions  
-    
-    for i in signals.index:
-        
-        #note that intraday and dataframe have different frequencies
-        #obviously different metrics for indexes
-        #we use variable date for index convertion
-        date='%s-%s-%s'%(i.year,i.month,i.day)
-        
-        
-        #market opening
-        #set up thresholds
-        if (i.hour==3 and i.minute==0):
-            sigup=float(param*intraday['range'][date]+pd.Series(signals[column])[i])
-            siglo=float(-(1-param)*intraday['range'][date]+pd.Series(signals[column])[i])
+def signal_generation(
+    df,
+    intraday,
+    param=0.5,
+    column='price',
+    start_hour=3,
+    end_hour=12,
+):
+    """
+    根据 Dual Thrust 阈值生成交易信号。
 
-        #thresholds got breached
-        #signals generating
-        if (sigup!=0 and pd.Series(signals[column])[i]>sigup):
-            signals.at[i,'signals']=1
-        if (siglo!=0 and pd.Series(signals[column])[i]<siglo):
-            signals.at[i,'signals']=-1
+    param:
+        突破参数。常见取值为 0.5，表示上下方向各使用一半 range。
 
+    signals:
+        1  表示买入方向的交易；
+       -1  表示卖出方向的交易；
+        2  表示从空头直接反手为多头；
+       -2  表示从多头直接反手为空头。
 
-        #check if signal has been generated
-        #if so, use cumsum to verify that we only generate one signal for each situation
-        if pd.Series(signals['signals'])[i]!=0:
-            signals['cumsum']=signals['signals'].cumsum()        
-            if (pd.Series(signals['cumsum'])[i]>1 or pd.Series(signals['cumsum'])[i]<-1):
-                signals.at[i,'signals']=0
-               
-            #if the price goes from below the lower threshold to above the upper threshold during the day
-            #we reverse our positions from short to long
-            if (pd.Series(signals['cumsum'])[i]==0):
-                if (pd.Series(signals[column])[i]>sigup):
-                    signals.at[i,'signals']=2
-                if (pd.Series(signals[column])[i]<siglo):
-                    signals.at[i,'signals']=-2
-                    
-        #by the end of london market, which is est 12pm
-        #we clear all opening positions
-        #the whole part is very similar to London Breakout strategy
-        if i.hour==12 and i.minute==0:
-            sigup,siglo=float(0),float(0)
-            signals['cumsum']=signals['signals'].cumsum()
-            signals.at[i,'signals']=-signals['cumsum'][i:i]
-            
-        #keep track of trigger levels
-        signals.at[i,'upper']=sigup
-        signals.at[i,'lower']=siglo
+    cumsum:
+        当前仓位。1 是多头，-1 是空头，0 是空仓。
+    """
+
+    if not 0 < param < 1:
+        raise ValueError('param 应该在 0 和 1 之间。')
+
+    signals = df.copy()
+    signals['signals'] = 0
+    signals['cumsum'] = 0
+    signals['upper'] = 0.0
+    signals['lower'] = 0.0
+
+    sigup = None
+    siglo = None
+    position = 0
+
+    for current_time in signals.index:
+        current_day = current_time.normalize()
+        price = signals.at[current_time, column]
+        signal = 0
+
+        # 开盘时根据当日开盘价和过去 rg 天 range 设置上下阈值。
+        if current_time.hour == start_hour and current_time.minute == 0:
+            day_range = (
+                intraday.at[current_day, 'range']
+                if current_day in intraday.index
+                else np.nan
+            )
+
+            if not pd.isna(day_range):
+                sigup = price + param * day_range
+                siglo = price - (1 - param) * day_range
+            else:
+                sigup = None
+                siglo = None
+
+        # 日内交易结束，清空所有仓位并重置阈值。
+        if current_time.hour == end_hour and current_time.minute == 0:
+            if position != 0:
+                signal = -position
+                position = 0
+
+            sigup = None
+            siglo = None
+
+        # 交易时段内，价格突破阈值时开仓或反手。
+        elif sigup is not None and siglo is not None:
+            if price > sigup and position != 1:
+                desired_position = 1
+                signal = desired_position - position
+                position = desired_position
+
+            elif price < siglo and position != -1:
+                desired_position = -1
+                signal = desired_position - position
+                position = desired_position
+
+        signals.at[current_time, 'signals'] = signal
+        signals.at[current_time, 'cumsum'] = position
+        signals.at[current_time, 'upper'] = sigup if sigup is not None else 0.0
+        signals.at[current_time, 'lower'] = siglo if siglo is not None else 0.0
 
     return signals
 
-#plotting the positions
-def plot(signals,intraday,column):
-        
-    #we have to do a lil bit slicing to make sure we can see the plot clearly
-    #the only reason i go to -3 is that day we execute a trade    
-    #give one hour before and after market trading hour for as x axis  
-    date=pd.to_datetime(intraday['date']).iloc[-3]      
-    signew=signals['%s-%s-%s 02:00:00'%(date.year,date.month,date.day):'%s-%s-%s 13:00:00'%(date.year,date.month,date.day)]
-    
-    fig=plt.figure(figsize=(10,5))
-    ax=fig.add_subplot(111)    
-    
-    #mostly the same as other py files
-    #the only difference is to create an interval for signal generation
-    ax.plot(signew.index,signew[column],label=column)
-    ax.fill_between(signew.loc[signew['upper']!=0].index,signew['upper'][signew['upper']!=0],signew['lower'][signew['upper']!=0],alpha=0.2,color='#355c7d')
-    ax.plot(signew.loc[signew['signals']==1].index,signew[column][signew['signals']==1],lw=0,marker='^',markersize=10,c='g',label='LONG')
-    ax.plot(signew.loc[signew['signals']==-1].index,signew[column][signew['signals']==-1],lw=0,marker='v',markersize=10,c='r',label='SHORT')
 
-    #change legend text color
-    lgd=plt.legend(loc='best').get_texts()
-    for text in lgd:
+def plot(signals, intraday, column='price'):
+    """
+    绘制某个发生交易的交易日，展示价格、上下阈值和交易信号。
+    """
+
+    output_dir = Path(__file__).resolve().parent / 'Dual Thrust'
+    output_dir.mkdir(exist_ok=True)
+
+    trade_days = signals.index[signals['signals'] != 0].normalize().unique()
+
+    if len(trade_days) > 0:
+        date = trade_days[-1]
+    else:
+        valid_days = intraday.index[~intraday['range'].isna()]
+        if len(valid_days) == 0:
+            print('没有足够数据绘图。')
+            return
+        date = valid_days[-1]
+
+    start = pd.Timestamp(date) + pd.Timedelta(hours=2)
+    end = pd.Timestamp(date) + pd.Timedelta(hours=13)
+    signew = signals.loc[start:end]
+
+    if signew.empty:
+        print('选定日期没有可绘制的数据。')
+        return
+
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+
+    ax.plot(signew.index, signew[column], label=column)
+
+    threshold_mask = signew['upper'] != 0
+    ax.fill_between(
+        signew.index[threshold_mask],
+        signew.loc[threshold_mask, 'upper'],
+        signew.loc[threshold_mask, 'lower'],
+        alpha=0.2,
+        color='#355c7d',
+    )
+
+    long_mask = signew['signals'] > 0
+    short_mask = signew['signals'] < 0
+
+    ax.plot(
+        signew.index[long_mask],
+        signew.loc[long_mask, column],
+        lw=0,
+        marker='^',
+        markersize=10,
+        c='g',
+        label='LONG',
+    )
+    ax.plot(
+        signew.index[short_mask],
+        signew.loc[short_mask, column],
+        lw=0,
+        marker='v',
+        markersize=10,
+        c='r',
+        label='SHORT',
+    )
+
+    legend_texts = ax.legend(loc='best').get_texts()
+    for text in legend_texts:
         text.set_color('#6C5B7B')
 
-    #add some captions
-    plt.text('%s-%s-%s 03:00:00'%(date.year,date.month,date.day),signew['upper']['%s-%s-%s 03:00:00'%(date.year,date.month,date.day)],'Upper Bound',color='#C06C84')
-    plt.text('%s-%s-%s 03:00:00'%(date.year,date.month,date.day),signew['lower']['%s-%s-%s 03:00:00'%(date.year,date.month,date.day)],'Lower Bound',color='#C06C84')
-    
-    plt.ylabel(column)
-    plt.xlabel('Date')
-    plt.title('Dual Thrust')
-    plt.grid(True)
-    plt.show()
+    opening_time = pd.Timestamp(date) + pd.Timedelta(hours=3)
+    if opening_time in signew.index:
+        ax.text(
+            opening_time,
+            signew.at[opening_time, 'upper'],
+            'Upper Bound',
+            color='#C06C84',
+        )
+        ax.text(
+            opening_time,
+            signew.at[opening_time, 'lower'],
+            'Lower Bound',
+            color='#C06C84',
+        )
+
+    ax.set_ylabel(column)
+    ax.set_xlabel('Date')
+    ax.set_title('Dual Thrust')
+    ax.grid(True)
+    fig.savefig(
+        output_dir / f'{pd.Timestamp(date).strftime("%Y-%m-%d")}_dual_thrust.png',
+        dpi=300,
+        bbox_inches='tight',
+    )
+    plt.close(fig)
 
 
-
-# In[4]:
 def main():
-    
-    #similar to London Breakout
-    #my raw data comes from the same website
-    # http://www.histdata.com/download-free-forex-data/?/excel/1-minute-bar-quotes
-    #just take the mid price of whatever currency pair you want
+    """
+    读取数据、计算 Dual Thrust 阈值、生成信号并绘图。
+    """
 
-    df=pd.read_csv('gbpusd.csv')
-    df.set_index(pd.to_datetime(df['date']),inplace=True)
+    rg = 5
+    param = 0.5
+    column = 'price'
 
-    #rg is the lags of days
-    #param is the parameter of trigger range, it should be smaller than one
-    #normally ppl use 0.5 to give long and short 50/50 chance to trigger
-    rg=5
-    param=0.5
+    df = load_price_data()
+    intraday = min2day(df, column=column, rg=rg)
+    signals = signal_generation(
+        df,
+        intraday,
+        param=param,
+        column=column,
+    )
+    plot(signals, intraday, column)
 
-    #these three variables are for the frequency convertion from minute to intra daily
-    year=df.index[0].year
-    month=df.index[0].month
-    column='price'
-    
-    intraday=min2day(df,column,year,month,rg)
-    signals=signal_generation(df,intraday,param,column,rg)
-    plot(signals,intraday,column)
 
-#how to calculate stats could be found from my other code called Heikin-Ashi
-# https://github.com/je-suis-tm/quant-trading/blob/master/heikin%20ashi%20backtest.py
+# 绩效统计可以参考项目中的 Heikin-Ashi backtest.py。
+
 
 if __name__ == '__main__':
     main()
